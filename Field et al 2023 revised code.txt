@@ -1,0 +1,409 @@
+################################################################################
+################# MODERNIZED SCRIPT FOR FIELD ET AL. 2021 ######################
+################################################################################
+
+library(terra)
+library(sf)
+library(movecost)
+library(leastcostpath)
+library(tidyverse)
+library(spatialEco)
+library(magrittr)
+library(sp)
+library(devtools)
+
+# set working directory and set master projection if re-projecting
+setwd("C:/Users/Colin Omilanowski/Downloads/Field_Test/Arch_test")
+
+# Set global projection
+master_crs <- "EPSG:26913" # UTM Zone 13N NAD83
+
+###########################################################
+################## STEP 1: IMPORT DATA ####################
+###########################################################
+
+# Import vectors using sf
+# Ensure these files exist in your directory
+origins <- terra::vect("./raw_data/origin_locations.shp") 
+sites <- terra::vect("./raw_data/Sites_Test.shp")
+
+destination1 <- sites[sites$Name == "Corridor 2 destination", ]
+destination2 <- sites[sites$Name == "Corridor 3 destination", ]
+
+# Import DEM using terra
+dem <- terra::rast('./raw_data/DEM_corridor1.tif')
+dem_raster <- raster::raster(dem)
+
+# Reproject to master CRS if necessary
+origins      <- terra::project(origins, master_crs)
+sites        <- terra::project(sites,   master_crs)
+destination1 <- terra::project(destination1, master_crs)
+dem          <- terra::project(dem, master_crs)
+
+###########################################################
+####### STEP 2: CREATE CONDUCTANCE SURFACES  ##############
+###########################################################
+
+# 2.1 Terrain Ruggedness (using terra)
+tri_dem <- terra::terrain(dem, v = "TRI")
+
+# 2.2 Create Slope-based Cost Surfaces (leastcostpath)
+neigh <- 16
+tobler_cs   <- create_slope_cs(dem, cost_function = "tobler", neighbours = neigh)
+ic_off_m_cs <- create_slope_cs(dem, cost_function = "irmischer-clarke offpath male", neighbours = neigh)
+campbell_cs <- create_slope_cs(dem, cost_function = "campbell 2019 50", neighbours = neigh)
+herzog_cs   <- create_slope_cs(dem, cost_function = "herzog", neighbours = neigh)
+ls_cs       <- create_slope_cs(dem, cost_function = "llobera-sluckin", neighbours = neigh)
+
+# 2.3 Pandolf Surface using movecost
+# movecost handles the complex Pandolf/Santee slope-switching logic automatically
+# Note: movecost creates its own transition layers
+
+# 2.3 Pandolf Surface using movecost
+W <- 63.5      # body mass
+L <- 20        # load mass (kg)
+V <- 1.26      # velocity in km/h 
+N <- 1.2       # terrain coefficient
+
+# We use 'side_t' to explicitly define the terrain coefficient 
+# and 'v' for velocity to avoid any abbreviation confusion.
+# stopped here
+
+# Compute slope raster (rise/run, dimensionless) with terra
+# terrain() returns slope in degrees by default; convert to tangent (rise/run)
+slope_deg <- terra::terrain(dem, v = "slope", unit = "degrees", neighbors = 8)
+slope_tan <- tan(slope_deg * pi / 180)   # dimensionless slope (rise/run)
+
+# ── Pandolf cost function (positive slopes) ────────────────────────────────
+# Energy expenditure (W·kg⁻¹) following Pandolf et al. 1977
+pandolf_energy <- function(s) {
+  # s = slope as decimal (rise/run), converted to % inside formula (* 100)
+  1.5 * W + 2.0 * (W + L) * (L / W)^2 +
+    N * (W + L) * (1.5 * V^2 + 0.35 * V * abs(s) * 100)
+}
+
+# ── Santee et al. (2001) cost function (negative slopes) ───────────────────
+santee_energy <- function(s) {
+  pandolf_energy(s) -
+    N * (V * abs(s) * 100 * (W + L) / 3.5 -
+           (W + L) * (abs(s) * 100 + 6)^2 / W +
+           (25 - V^2))
+}
+
+# Apply functions to slope raster; conductance = 1 / metabolic cost
+pandolf_pos_r <- terra::app(slope_tan, function(s) {
+  ifelse(s >= 0, 1 / pandolf_energy(s), NA)
+})
+pandolf_neg_r <- terra::app(slope_tan, function(s) {
+  ifelse(s < 0,  1 / santee_energy(s),  NA)
+})
+
+# Merge positive- and negative-slope surfaces
+pandolf_cs_r <- terra::cover(pandolf_pos_r, pandolf_neg_r)
+
+# ── movecost alternative for Pandolf ──────────────────────────────────────
+# movecost::movecost() has a built-in "Pandolf et al." cost function:
+#   movecost(dem, origin, destin, funct = "Pa", W = 63.5, L = 20, V = 0.35, N = 1.2)
+# This is the cleanest route if you prefer movecost over leastcostpath.
+
+# Clean up
+rm(pandolf_pos_r, pandolf_neg_r, slope_deg, slope_tan, W, L, N, V)
+
+###########################################################
+########### STEP #3: CALCULATE LEAST COST PATHS ###########
+########### FROM SERIES OF ORIGIN POINTS TO  ##############
+########### SEPARATE DESTINATIONS AND COMPUTE #############
+########### DETERMINING VARIABLES (TERRAIN, DISTANCE) #####
+###########################################################
+
+n <- nrow(origins)   # terra::nrow() or length() both work on SpatVector
+
+# Build results table
+result_destination1 <- as.data.frame(matrix(NA, nrow = n, ncol = 9))
+colnames(result_destination1) <- c(
+  "time (sq.m)", "energy (sq.m)", "overlap (sq.m)",
+  "mean time and energy (sq.m)", "overlap as percent of average",
+  "mean TRI within 1km of time lcps",    "median TRI within 1km of time lcps",
+  "mean TRI within 1km of energy lcps",  "median TRI within 1km of energy lcps"
+)
+
+for (i in seq_len(n)) 
+  
+  origin_i <- origins[i, ]
+
+terra::crs(tobler_cs, describe = TRUE)
+terra::crs(dem, describe = TRUE)
+terra::crs(origins, describe = TRUE)
+terra::crs(destination1, describe = TRUE)
+
+terra::ext(dem)
+terra::geom(origin_i)
+terra::geom(destination1)
+
+class(tobler_cs)
+print(tobler_cs)
+
+# ── Calculate LCPs ──────────────────────────────────────────────────────
+# leastcostpath 2.x: create_lcp() signature is largely unchanged but
+# accepts SpatVector (terra) instead of Spatial* objects.
+
+t_lcp  <- leastcostpath::create_lcp(tobler_cs,   origin_i, destination1)
+ic_lcp <- leastcostpath::create_lcp(ic_off_m_cs, origin_i, destination1)
+c_lcp  <- leastcostpath::create_lcp(campbell_cs, origin_i, destination1)
+h_lcp  <- leastcostpath::create_lcp(herzog_cs,   origin_i, destination1)
+ls_lcp <- leastcostpath::create_lcp(ls_cs,       origin_i, destination1)
+# Replace the pandolf_cs create_lcp line with this:
+# Then use dem_raster instead of dem in the movecost call
+p_lcp <- movecost::movecost(
+  dtm    = dem_raster,
+  origin = sf::st_as_sf(origin_i),
+  destin = sf::st_as_sf(destination1),
+  funct  = "Pa",
+  W      = 63.5,
+  L      = 20,
+  V      = 0.35,
+  N      = 1.2
+)$LCPs
+                    
+
+# Convert lcp SpatVector lines to sf for geometry operations
+# sf is more feature-rich for line/polygon operations than terra
+t_lcp_sf  <- sf::st_as_sf(t_lcp)
+ic_lcp_sf <- sf::st_as_sf(ic_lcp)
+c_lcp_sf  <- sf::st_as_sf(c_lcp)
+h_lcp_sf  <- sf::st_as_sf(h_lcp)
+ls_lcp_sf <- sf::st_as_sf(ls_lcp)
+p_lcp_sf  <- sf::st_as_sf(p_lcp)
+dest1_sf  <- sf::st_as_sf(destination1)
+
+# ── Sample points along each time-based LCP at ~100 m intervals ─────────
+# sf::st_line_sample() replaces sp::spsample()
+sample_pts <- function(lcp_sf, interval = 100) {
+  len_m <- as.numeric(sf::st_length(lcp_sf))
+  n_pts <- max(2L, round(len_m / interval))
+  sf::st_line_sample(lcp_sf, n = n_pts, type = "regular") |>
+    sf::st_cast("POINT") |>
+    sf::st_as_sf()
+}
+
+t_p  <- sample_pts(t_lcp_sf)
+ic_p <- sample_pts(ic_lcp_sf)
+c_p  <- sample_pts(c_lcp_sf)
+
+# Harmonise to minimum point count across the three sets
+l <- min(nrow(t_p), nrow(ic_p), nrow(c_p))
+t_p  <- t_p[seq_len(l), ]
+ic_p <- ic_p[seq_len(l), ]
+c_p  <- c_p[seq_len(l), ]
+
+# Helper: nearest distance from a point to a line (sf)
+dist_pt_to_line <- function(pt_sf, line_sf) {
+  as.numeric(sf::st_distance(pt_sf, line_sf))
+}
+
+# Helper: distance from a point to the destination
+dist_to_dest <- function(pt_sf, dest_sf, lcp_sf) {
+  lcp_len <- as.numeric(sf::st_length(lcp_sf))
+  d       <- as.numeric(sf::st_distance(pt_sf, dest_sf))
+  abs(d - lcp_len) / lcp_len
+}
+
+# ── Build per-interval comparison table ─────────────────────────────────
+result_difference <- as.data.frame(matrix(NA, nrow = l, ncol = 18))
+colnames(result_difference) <- c(
+  "tobler_pandolf",        "tobler_lloberasluckin",   "tobler_herzog",
+  "irmischer_pandolf",     "irmischer_herzog",         "irmischer_lloberasluckin",
+  "campbell_pandolf",      "campbell_lloberasluckin",  "campbell_herzog",
+  "tp_pctdist",            "tls_pctdist",              "th_pctdist",
+  "ip_pctdist",            "ils_pctdist",              "ih_pctdist",
+  "cp_pctdist",            "cls_pctdist",              "ch_pctdist"
+)
+
+for (j in seq_len(l)) {
+  result_difference[j,  1] <- dist_pt_to_line(t_p[j,],  p_lcp_sf)
+  result_difference[j,  2] <- dist_pt_to_line(t_p[j,],  ls_lcp_sf)
+  result_difference[j,  3] <- dist_pt_to_line(t_p[j,],  h_lcp_sf)
+  result_difference[j,  4] <- dist_pt_to_line(ic_p[j,], p_lcp_sf)
+  result_difference[j,  5] <- dist_pt_to_line(ic_p[j,], ls_lcp_sf)
+  result_difference[j,  6] <- dist_pt_to_line(ic_p[j,], h_lcp_sf)
+  result_difference[j,  7] <- dist_pt_to_line(c_p[j,],  p_lcp_sf)
+  result_difference[j,  8] <- dist_pt_to_line(c_p[j,],  ls_lcp_sf)
+  result_difference[j,  9] <- dist_pt_to_line(c_p[j,],  h_lcp_sf)
+  result_difference[j, 10:12] <- dist_to_dest(t_p[j,],  dest1_sf, t_lcp_sf)
+  result_difference[j, 13:15] <- dist_to_dest(ic_p[j,], dest1_sf, ic_lcp_sf)
+  result_difference[j, 16:18] <- dist_to_dest(c_p[j,],  dest1_sf, c_lcp_sf)
+}
+
+write.csv(result_difference,
+          paste0("./OUTPUT/result_difference_1_", i, ".csv"),
+          row.names = FALSE)
+
+# ── Bind & buffer time/energy LCPs ──────────────────────────────────────
+# sf::st_union() + sf::st_buffer() replaces gBuffer(rbind(...))
+t_all_sf <- sf::st_union(rbind(t_lcp_sf, ic_lcp_sf, c_lcp_sf))
+e_all_sf <- sf::st_union(rbind(h_lcp_sf, ls_lcp_sf, p_lcp_sf))
+
+t_buff_sf <- sf::st_buffer(t_all_sf, dist = 125)
+e_buff_sf <- sf::st_buffer(e_all_sf, dist = 125)
+
+# Export buffered corridors as shapefiles
+# sf::st_write() replaces rgdal::writeOGR()
+sf::st_write(sf::st_as_sf(t_buff_sf),
+             paste0("./OUTPUT/all_time_buff_origin",   i, ".shp"),
+             delete_dsn = TRUE)
+sf::st_write(sf::st_as_sf(e_buff_sf),
+             paste0("./OUTPUT/all_energy_buff_origin", i, ".shp"),
+             delete_dsn = TRUE)
+
+# ── Overlap between time & energy corridors ──────────────────────────────
+# sf::st_intersection() replaces rgeos::gIntersection()
+overlap_sf <- sf::st_intersection(t_buff_sf, e_buff_sf)
+sf::st_write(sf::st_as_sf(overlap_sf),
+             paste0("./OUTPUT/overlap_buff_origin", i, ".shp"),
+             delete_dsn = TRUE)
+
+# ── TRI extraction within buffered corridors ─────────────────────────────
+# terra::extract() replaces raster::extract()
+t_buff_terra  <- terra::vect(t_buff_sf)
+e_buff_terra  <- terra::vect(e_buff_sf)
+
+t_buff_tri_extract <- terra::extract(tri_dem, t_buff_terra)$lyr.1
+e_buff_tri_extract <- terra::extract(tri_dem, e_buff_terra)$lyr.1
+
+# Remove NAs before summary stats
+t_buff_tri_extract <- t_buff_tri_extract[!is.na(t_buff_tri_extract)]
+e_buff_tri_extract <- e_buff_tri_extract[!is.na(e_buff_tri_extract)]
+
+# Bind and export TRI table
+all_tri <- rbind(
+  data.frame(value = t_buff_tri_extract, cost = "time"),
+  data.frame(value = e_buff_tri_extract, cost = "energy")
+)
+write.csv(all_tri,
+          paste0("./OUTPUT/result_tri_1_", i, ".csv"),
+          row.names = FALSE)
+
+# ── Summary statistics for this loop iteration ───────────────────────────
+# terra::expanse() replaces raster::area() for polygons
+result_destination1[i, 1] <- terra::expanse(t_buff_terra)
+result_destination1[i, 2] <- terra::expanse(e_buff_terra)
+result_destination1[i, 3] <- terra::expanse(terra::vect(overlap_sf))
+result_destination1[i, 4] <- (terra::expanse(t_buff_terra) +
+                                terra::expanse(e_buff_terra)) / 2
+result_destination1[i, 5] <- terra::expanse(terra::vect(overlap_sf)) /
+  result_destination1[i, 4]
+result_destination1[i, 6] <- mean(t_buff_tri_extract)
+result_destination1[i, 7] <- median(t_buff_tri_extract)
+result_destination1[i, 8] <- mean(e_buff_tri_extract)
+result_destination1[i, 9] <- median(e_buff_tri_extract)
+
+write.csv(result_destination1,
+          "./OUTPUT/results_destination_1.csv",
+          row.names = FALSE)
+
+
+# 1. Convert the terra DEM to the older raster format
+# This is required because movecost's internal 'transition' function 
+# does not yet support 'SpatRaster' objects directly in all versions.
+dem_raster <- raster::raster(dem)
+
+# 2. Run movecost with the compatible object
+# Use 't' instead of 'N' (movecost uses 't' for terrain weight)
+# Put "h" in quotes
+pandolf_data <- movecost(dtm = dem_raster, origin = as(origins[1,], "Spatial"),
+                         funct = "pandolf", W = W, L = L, V = V, t = N, time = "h")
+
+# The transition layer is stored here:
+pandolf_cs <- pandolf_data$transitionLayer  # correct slot name
+
+# Extract the conductance matrix
+pandolf_cs <- pandolf_data$conductance
+
+###########################################################
+########### STEP 3: LOOPED LCP ANALYSIS ###################
+###########################################################
+
+n <- nrow(origins)
+result_destination1 <- data.frame(matrix(NA, nrow = n, ncol = 9))
+colnames(result_destination1) <- c("time_area", "energy_area", "overlap_area", "mean_area", 
+                                   "overlap_pct", "mean_tri_time", "med_tri_time", 
+                                   "mean_tri_energy", "med_tri_energy")
+
+for(i in 1:n) {
+  origin <- origins[i,]
+  
+  # Calculate LCPs
+  t_lcp  <- create_lcp(tobler_cs, origin, destination1)
+  ic_lcp <- create_lcp(ic_off_m_cs, origin, destination1)
+  c_lcp  <- create_lcp(campbell_cs, origin, destination1)
+  h_lcp  <- create_lcp(herzog_cs, origin, destination1)
+  ls_lcp <- create_lcp(ls_cs, origin, destination1)
+  p_lcp  <- create_lcp(pandolf_cs, origin, destination1)
+  
+  # Buffer paths using sf (125m buffer)
+  # Combine time-based paths
+  t_all <- st_union(st_as_sf(rbind(t_lcp, ic_lcp, c_lcp)))
+  t_buff <- st_buffer(t_all, 125)
+  
+  # Combine energy-based paths
+  e_all <- st_union(st_as_sf(rbind(h_lcp, ls_lcp, p_lcp)))
+  e_buff <- st_buffer(e_all, 125)
+  
+  # Intersection/Overlap
+  overlap <- st_intersection(t_buff, e_buff)
+  
+  # Terrain Extraction (terra)
+  t_tri_vals <- terra::extract(tri_dem, vect(t_buff))[[2]]
+  e_tri_vals <- terra::extract(tri_dem, vect(e_buff))[[2]]
+  
+  # Calculations
+  t_area <- as.numeric(st_area(t_buff))
+  e_area <- as.numeric(st_area(e_buff))
+  o_area <- if(length(overlap) > 0) as.numeric(st_area(overlap)) else 0
+  
+  result_destination1[i, 1:5] <- c(t_area, e_area, o_area, (t_area+e_area)/2, o_area/((t_area+e_area)/2))
+  result_destination1[i, 6:9] <- c(mean(t_tri_vals, na.rm=T), median(t_tri_vals, na.rm=T),
+                                   mean(e_tri_vals, na.rm=T), median(e_tri_vals, na.rm=T))
+  
+  # Export Spatial Data
+  st_write(t_buff, paste0("./OUTPUT/time_buff_", i, ".shp"), delete_dsn = TRUE)
+}
+
+write.csv(result_destination1, "./OUTPUT/results_summary.csv")
+
+###########################################################
+########### STEP 4: ROADS AS CONDUITS (TERRA) #############
+###########################################################
+
+# Use terra::resample and logic for conduits
+conduit_rast <- rast('./DATA/DEM/DEM_corridor3_conduit.tif')
+dem3 <- rast('./DATA/DEM/DEM_corridor3.tif')
+
+conduit_resampled <- resample(conduit_rast, dem3, method = "bilinear")
+# Classify conduit (1 for road, NA elsewhere)
+road_mask <- conduit_resampled > 1.5 & conduit_resampled < 2.0
+road_mask[road_mask == 0] <- NA
+
+# Add conductance boost
+base_cs <- create_slope_cs(dem3, cost_function = "tobler", neighbours = 16)
+# Create a boost layer where the road is
+road_boost <- create_barrier_cs(dem3, barrier = vect(road_mask), field = 0.1, background = 0)
+road_conductance <- base_cs + road_boost
+
+###########################################################
+########### STEP 5: FATIGUE THRESHOLDS ####################
+###########################################################
+
+# Note: accCost is now handled by leastcostpath::create_accumulated_cost
+acc_tobler <- create_accumulated_cost(tobler_cs, origins[1,])
+
+# Create 30-minute threshold (1800s)
+fatigue_mask <- acc_tobler < 1800
+# Convert to vector for intersection
+fatigue_poly <- as.polygons(fatigue_mask) %>% st_as_sf() %>% filter(layer == 1)
+fatigue_line <- st_cast(fatigue_poly, "LINESTRING")
+
+# Find intersection point (replaces gIntersection)
+intersection_pt <- st_intersection(st_as_sf(t_lcp), fatigue_line)
+
+# Proceed with leg 2 calculations using this intersection_pt as the new origin.
